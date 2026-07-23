@@ -46,17 +46,33 @@ class CANSOFT_Order_Info_Admin {
             'type'              => 'string',
             'sanitize_callback' => 'sanitize_text_field',
         ]);
+        register_setting(self::OPTION_GROUP, 'cansoft_order_info_store_type', [
+            'type'              => 'string',
+            'default'           => 'auto',
+            'sanitize_callback' => 'sanitize_text_field',
+        ]);
+        register_setting(self::OPTION_GROUP, 'cansoft_order_info_ecwid_store_id', [
+            'type'              => 'string',
+            'sanitize_callback' => 'sanitize_text_field',
+        ]);
+        register_setting(self::OPTION_GROUP, 'cansoft_order_info_ecwid_token', [
+            'type'              => 'string',
+            'sanitize_callback' => 'sanitize_text_field',
+        ]);
     }
 
     public function render_settings_page() {
         if (!current_user_can('manage_options')) {
             return;
         }
-        $secret = get_option('cansoft_order_info_secret', get_option('cansoft_finance_secret', ''));
+        $secret     = get_option('cansoft_order_info_secret', get_option('cansoft_finance_secret', ''));
+        $store_type = get_option('cansoft_order_info_store_type', 'auto');
+        $ecwid_id   = get_option('cansoft_order_info_ecwid_store_id', get_option('ecwid_store_id', ''));
+        $ecwid_tok  = get_option('cansoft_order_info_ecwid_token', get_option('ecwid_oauth_token', get_option('ecwid_api_secret_key', '')));
         ?>
         <div class="wrap">
             <h1><?php echo esc_html(get_admin_page_title()); ?></h1>
-            <p class="description"><?php esc_html_e('Provides REST API endpoints for the Cansoft Report System on the main site to fetch sales and order metrics on demand.', 'cansoft-order-info-send'); ?></p>
+            <p class="description"><?php esc_html_e('Provides REST API endpoints for the Cansoft Report System on the main site to fetch sales and order metrics on demand from WooCommerce or Ecwid.', 'cansoft-order-info-send'); ?></p>
             <form method="post" action="options.php">
                 <?php settings_fields(self::OPTION_GROUP); ?>
                 <table class="form-table">
@@ -67,6 +83,36 @@ class CANSOFT_Order_Info_Admin {
                         <td>
                             <input type="password" name="cansoft_order_info_secret" id="cansoft_order_info_secret" value="<?php echo esc_attr($secret); ?>" class="regular-text" autocomplete="off">
                             <p class="description"><?php esc_html_e('Set a secret key. Enter this same secret in Project Settings -> API tab on your Main Cansoft Site.', 'cansoft-order-info-send'); ?></p>
+                        </td>
+                    </tr>
+                    <tr>
+                        <th scope="row">
+                            <label for="cansoft_order_info_store_type"><?php esc_html_e('Store Platform', 'cansoft-order-info-send'); ?></label>
+                        </th>
+                        <td>
+                            <select name="cansoft_order_info_store_type" id="cansoft_order_info_store_type">
+                                <option value="auto" <?php selected($store_type, 'auto'); ?>><?php esc_html_e('Auto-Detect (WooCommerce / Ecwid)', 'cansoft-order-info-send'); ?></option>
+                                <option value="woocommerce" <?php selected($store_type, 'woocommerce'); ?>><?php esc_html_e('WooCommerce', 'cansoft-order-info-send'); ?></option>
+                                <option value="ecwid" <?php selected($store_type, 'ecwid'); ?>><?php esc_html_e('Ecwid by Lightspeed', 'cansoft-order-info-send'); ?></option>
+                            </select>
+                        </td>
+                    </tr>
+                    <tr class="cansoft-ecwid-field">
+                        <th scope="row">
+                            <label for="cansoft_order_info_ecwid_store_id"><?php esc_html_e('Ecwid Store ID', 'cansoft-order-info-send'); ?></label>
+                        </th>
+                        <td>
+                            <input type="text" name="cansoft_order_info_ecwid_store_id" id="cansoft_order_info_ecwid_store_id" value="<?php echo esc_attr($ecwid_id); ?>" class="regular-text" placeholder="e.g. 12345678">
+                            <p class="description"><?php esc_html_e('Leave empty to auto-detect from installed Ecwid plugin.', 'cansoft-order-info-send'); ?></p>
+                        </td>
+                    </tr>
+                    <tr class="cansoft-ecwid-field">
+                        <th scope="row">
+                            <label for="cansoft_order_info_ecwid_token"><?php esc_html_e('Ecwid API Access Token', 'cansoft-order-info-send'); ?></label>
+                        </th>
+                        <td>
+                            <input type="password" name="cansoft_order_info_ecwid_token" id="cansoft_order_info_ecwid_token" value="<?php echo esc_attr($ecwid_tok); ?>" class="regular-text" autocomplete="off">
+                            <p class="description"><?php esc_html_e('Leave empty to auto-detect from installed Ecwid plugin.', 'cansoft-order-info-send'); ?></p>
                         </td>
                     </tr>
                 </table>
@@ -111,14 +157,12 @@ class CANSOFT_Order_Info_Admin {
     }
 
     public function register_rest_routes() {
-        // Primary endpoint for Cansoft Order Info
         register_rest_route('cansoft-order-info/v1', 'sales-report', [
             'methods'             => 'POST',
             'callback'            => [$this, 'handle_sales_report_request'],
             'permission_callback' => '__return_true',
         ]);
 
-        // Alias for backward compatibility
         register_rest_route('cansoft-finance-management/v1', 'sales-report', [
             'methods'             => 'POST',
             'callback'            => [$this, 'handle_sales_report_request'],
@@ -139,29 +183,49 @@ class CANSOFT_Order_Info_Admin {
         }
 
         $params = $request->get_json_params();
-        $current_start = isset($params['current_start']) ? sanitize_text_field($params['current_start']) : '';
-        $current_end = isset($params['current_end']) ? sanitize_text_field($params['current_end']) : '';
+        if (!is_array($params)) {
+            $params = [];
+        }
+
+        $current_start  = isset($params['current_start']) ? sanitize_text_field($params['current_start']) : '';
+        $current_end    = isset($params['current_end']) ? sanitize_text_field($params['current_end']) : '';
         $previous_start = isset($params['previous_start']) ? sanitize_text_field($params['previous_start']) : '';
-        $previous_end = isset($params['previous_end']) ? sanitize_text_field($params['previous_end']) : '';
+        $previous_end   = isset($params['previous_end']) ? sanitize_text_field($params['previous_end']) : '';
 
         if (empty($current_start) || empty($current_end) || empty($previous_start) || empty($previous_end)) {
             return new \WP_REST_Response(['message' => __('Missing date parameters.', 'cansoft-order-info-send')], 400);
         }
 
-        $current_data = $this->get_sales_metrics_for_period($current_start, $current_end);
-        $previous_data = $this->get_sales_metrics_for_period($previous_start, $previous_end);
+        $current_data  = $this->get_sales_metrics_for_period($current_start, $current_end, $params);
+        $previous_data = $this->get_sales_metrics_for_period($previous_start, $previous_end, $params);
 
         return new \WP_REST_Response([
-            'current' => $current_data,
+            'current'  => $current_data,
             'previous' => $previous_data,
         ], 200);
     }
 
-    protected function get_sales_metrics_for_period($start_date, $end_date) {
+    protected function get_sales_metrics_for_period($start_date, $end_date, $request_params = []) {
+        $store_type = get_option('cansoft_order_info_store_type', 'auto');
+        if (!empty($request_params['store_type'])) {
+            $store_type = sanitize_text_field($request_params['store_type']);
+        }
+
+        $ecwid_id = get_option('cansoft_order_info_ecwid_store_id', get_option('ecwid_store_id', ''));
+        $is_ecwid = ($store_type === 'ecwid') || (!empty($ecwid_id) && $store_type !== 'woocommerce');
+
+        if ($is_ecwid) {
+            return $this->get_ecwid_sales_metrics_for_period($start_date, $end_date, $request_params);
+        }
+
+        return $this->get_woocommerce_sales_metrics_for_period($start_date, $end_date);
+    }
+
+    protected function get_woocommerce_sales_metrics_for_period($start_date, $end_date) {
         global $wpdb;
 
         $start = $start_date . ' 00:00:00';
-        $end = $end_date . ' 23:59:59';
+        $end   = $end_date . ' 23:59:59';
 
         $summary = $wpdb->get_row($wpdb->prepare(
             "SELECT 
@@ -176,10 +240,10 @@ class CANSOFT_Order_Info_Admin {
             $end
         ), ARRAY_A);
 
-        $total_sales = isset($summary['total_sales']) ? floatval($summary['total_sales']) : 0;
-        $total_orders = isset($summary['total_orders']) ? intval($summary['total_orders']) : 0;
+        $total_sales      = isset($summary['total_sales']) ? floatval($summary['total_sales']) : 0;
+        $total_orders     = isset($summary['total_orders']) ? intval($summary['total_orders']) : 0;
         $total_items_sold = isset($summary['total_items_sold']) ? intval($summary['total_items_sold']) : 0;
-        $avg_order_value = $total_orders > 0 ? ($total_sales / $total_orders) : 0;
+        $avg_order_value  = $total_orders > 0 ? ($total_sales / $total_orders) : 0;
 
         $status_rows = $wpdb->get_results($wpdb->prepare(
             "SELECT status, COUNT(order_id) as count
@@ -210,11 +274,216 @@ class CANSOFT_Order_Info_Admin {
         }
 
         return [
-            'total_sales'      => $total_sales,
+            'total_sales'      => round($total_sales, 2),
             'total_orders'     => $total_orders,
             'total_items_sold' => $total_items_sold,
-            'avg_order_value'  => $avg_order_value,
+            'avg_order_value'  => round($avg_order_value, 2),
             'status_counts'    => $status_counts,
+        ];
+    }
+
+    protected function get_ecwid_sales_metrics_for_period($start_date, $end_date, $request_params = []) {
+        $store_id = !empty($request_params['ecwid_store_id']) ? sanitize_text_field($request_params['ecwid_store_id']) : get_option('cansoft_order_info_ecwid_store_id', get_option('ecwid_store_id', ''));
+        $token    = !empty($request_params['ecwid_token']) ? sanitize_text_field($request_params['ecwid_token']) : get_option('cansoft_order_info_ecwid_token', get_option('ecwid_oauth_token', get_option('ecwid_api_secret_key', '')));
+
+        if (empty($store_id) || empty($token)) {
+            CANSOFT_Order_Info_Sender::log('Ecwid fetch aborted: Store ID or Token is empty', [
+                'store_id'  => $store_id,
+                'has_token' => !empty($token)
+            ]);
+            return [
+                'total_sales'      => 0,
+                'total_orders'     => 0,
+                'total_items_sold' => 0,
+                'avg_order_value'  => 0,
+                'status_counts'    => [
+                    'completed' => 0, 'failed' => 0, 'cancelled' => 0, 'refunded' => 0, 'on_hold' => 0, 'processing' => 0
+                ],
+                'debug_error'      => 'Missing Store ID or Token',
+            ];
+        }
+
+        $all_orders = [];
+        $debug_log = [];
+
+        // Try date formats in order: Unix timestamp in seconds -> ISO 8601 -> YYYY-MM-DD HH:MM:SS -> YYYY-MM-DD
+        $ts_start = strtotime($start_date . ' 00:00:00');
+        $ts_end   = strtotime($end_date . ' 23:59:59');
+
+        $date_formats = [
+            ['from' => (string)$ts_start,               'to' => (string)$ts_end],
+            ['from' => (string)($ts_start * 1000),      'to' => (string)($ts_end * 1000)],
+            ['from' => $start_date . 'T00:00:00Z',     'to' => $end_date . 'T23:59:59Z'],
+            ['from' => $start_date . ' 00:00:00',      'to' => $end_date . ' 23:59:59'],
+            ['from' => $start_date,                     'to' => $end_date],
+        ];
+
+        foreach ($date_formats as $df) {
+            $offset = 0;
+            $limit  = 100;
+            $batch_orders = [];
+
+            do {
+                $url = sprintf(
+                    'https://app.ecwid.com/api/v3/%s/orders?token=%s&createdFrom=%s&createdTo=%s&offset=%d&limit=%d',
+                    rawurlencode($store_id),
+                    rawurlencode($token),
+                    rawurlencode($df['from']),
+                    rawurlencode($df['to']),
+                    $offset,
+                    $limit
+                );
+
+                $response = wp_remote_get($url, [
+                    'timeout' => 20,
+                    'headers' => [
+                        'Accept'        => 'application/json',
+                        'Authorization' => 'Bearer ' . $token,
+                    ],
+                ]);
+
+                if (is_wp_error($response)) {
+                    $debug_log[] = 'WP_Error: ' . $response->get_error_message();
+                    break;
+                }
+
+                $code = wp_remote_retrieve_response_code($response);
+                $body = wp_remote_retrieve_body($response);
+
+                if ($code !== 200) {
+                    $debug_log[] = "HTTP {$code}: {$body}";
+                    break;
+                }
+
+                $data = json_decode($body, true);
+                if (!is_array($data)) {
+                    $debug_log[] = 'Invalid JSON: ' . $body;
+                    break;
+                }
+
+                $items_count = (!empty($data['items']) && is_array($data['items'])) ? count($data['items']) : 0;
+                $debug_log[] = "Fetched {$items_count} orders (format {$df['from']} to {$df['to']})";
+
+                if ($items_count === 0) {
+                    break;
+                }
+
+                $items = $data['items'];
+                $batch_orders = array_merge($batch_orders, $items);
+                $total_count = isset($data['total']) ? intval($data['total']) : count($batch_orders);
+
+                $offset += count($items);
+            } while ($offset < $total_count && $items_count >= $limit);
+
+            if (!empty($batch_orders)) {
+                $all_orders = $batch_orders;
+                break;
+            }
+        }
+
+        // Final Fallback: Fetch recent 100 orders without createdFrom/createdTo and filter in PHP
+        if (empty($all_orders)) {
+            $url = sprintf(
+                'https://app.ecwid.com/api/v3/%s/orders?token=%s&limit=100',
+                rawurlencode($store_id),
+                rawurlencode($token)
+            );
+
+            $response = wp_remote_get($url, [
+                'timeout' => 20,
+                'headers' => [
+                    'Accept'        => 'application/json',
+                    'Authorization' => 'Bearer ' . $token,
+                ],
+            ]);
+
+            if (!is_wp_error($response) && wp_remote_retrieve_response_code($response) === 200) {
+                $body = wp_remote_retrieve_body($response);
+                $data = json_decode($body, true);
+                if (!empty($data['items']) && is_array($data['items'])) {
+                    $start_ts = strtotime($start_date . ' 00:00:00');
+                    $end_ts   = strtotime($end_date . ' 23:59:59');
+
+                    foreach ($data['items'] as $order) {
+                        $order_time = 0;
+                        if (!empty($order['createTimestamp'])) {
+                            $order_time = floatval($order['createTimestamp']);
+                            if ($order_time > 20000000000) {
+                                $order_time = intval($order_time / 1000);
+                            }
+                        } elseif (!empty($order['created'])) {
+                            $order_time = strtotime($order['created']);
+                        } elseif (!empty($order['createDate'])) {
+                            $order_time = strtotime($order['createDate']);
+                        }
+
+                        if ($order_time >= $start_ts && $order_time <= $end_ts) {
+                            $all_orders[] = $order;
+                        }
+                    }
+                    $debug_log[] = 'PHP filtered orders count: ' . count($all_orders) . ' out of ' . count($data['items']);
+                } else {
+                    $debug_log[] = 'Fallback raw body: ' . substr($body, 0, 300);
+                }
+            }
+        }
+
+        $total_sales      = 0;
+        $total_orders     = count($all_orders);
+        $total_items_sold = 0;
+        $status_counts    = [
+            'completed'  => 0,
+            'failed'     => 0,
+            'cancelled'  => 0,
+            'refunded'   => 0,
+            'on_hold'    => 0,
+            'processing' => 0,
+        ];
+
+        foreach ($all_orders as $order) {
+            $payment_status     = isset($order['paymentStatus']) ? strtoupper((string) $order['paymentStatus']) : '';
+            $fulfillment_status = isset($order['fulfillmentStatus']) ? strtoupper((string) $order['fulfillmentStatus']) : '';
+            $total              = isset($order['total']) ? floatval($order['total']) : 0;
+
+            if ($payment_status === 'PAID') {
+                $total_sales += $total;
+            }
+
+            if (!empty($order['items']) && is_array($order['items'])) {
+                foreach ($order['items'] as $item) {
+                    $qty = isset($item['quantity']) ? intval($item['quantity']) : 1;
+                    $total_items_sold += $qty;
+                }
+            }
+
+            if ($payment_status === 'PAID') {
+                if (in_array($fulfillment_status, ['AWAITING_PROCESSING', 'PROCESSING'])) {
+                    $status_counts['processing']++;
+                } else {
+                    $status_counts['completed']++;
+                }
+            } elseif ($payment_status === 'AWAITING_PAYMENT' || $payment_status === 'INCOMPLETE') {
+                $status_counts['on_hold']++;
+            } elseif ($payment_status === 'CANCELLED') {
+                $status_counts['cancelled']++;
+            } elseif ($payment_status === 'REFUNDED' || $payment_status === 'PARTIALLY_REFUNDED') {
+                $status_counts['refunded']++;
+            } elseif ($payment_status === 'DECLINED') {
+                $status_counts['failed']++;
+            } else {
+                $status_counts['completed']++;
+            }
+        }
+
+        $avg_order_value = $total_orders > 0 ? ($total_sales / $total_orders) : 0;
+
+        return [
+            'total_sales'      => round($total_sales, 2),
+            'total_orders'     => $total_orders,
+            'total_items_sold' => $total_items_sold,
+            'avg_order_value'  => round($avg_order_value, 2),
+            'status_counts'    => $status_counts,
+            'debug_log'        => $debug_log,
         ];
     }
 }

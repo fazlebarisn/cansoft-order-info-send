@@ -13,7 +13,7 @@ if (!defined('CANSOFT_ORDER_INFO_DEBUG')) {
 
 class CANSOFT_Order_Info_Sender {
 
-    protected static function log($message, $context = []) {
+    public static function log($message, $context = []) {
         if (!CANSOFT_ORDER_INFO_DEBUG) {
             return;
         }
