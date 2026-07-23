@@ -177,8 +177,14 @@ class CANSOFT_Order_Info_Admin {
                 wp_send_json_error(['message' => __('Ecwid Store ID or Access Token is missing.', 'cansoft-order-info-send')]);
             }
 
-            $url = 'https://app.ecwid.com/api/v3/' . rawurlencode($store_id) . '/orders?token=' . rawurlencode($token) . '&limit=1';
-            $response = wp_remote_get($url, ['timeout' => 15, 'headers' => ['Accept' => 'application/json']]);
+            $url = 'https://app.ecwid.com/api/v3/' . rawurlencode($store_id) . '/orders?limit=1';
+            $response = wp_remote_get($url, [
+                'timeout' => 15,
+                'headers' => [
+                    'Accept'        => 'application/json',
+                    'Authorization' => 'Bearer ' . $token,
+                ]
+            ]);
 
             if (is_wp_error($response)) {
                 wp_send_json_error(['message' => __('Ecwid API Error: ', 'cansoft-order-info-send') . $response->get_error_message()]);
@@ -378,10 +384,6 @@ class CANSOFT_Order_Info_Admin {
         ])));
 
         if (empty($store_id) || empty($tokens_to_try)) {
-            CANSOFT_Order_Info_Sender::log('Ecwid fetch aborted: Store ID or Token is empty', [
-                'store_id'  => $store_id,
-                'has_tokens' => !empty($tokens_to_try)
-            ]);
             return [
                 'total_sales'      => 0,
                 'total_orders'     => 0,
@@ -390,22 +392,20 @@ class CANSOFT_Order_Info_Admin {
                 'status_counts'    => [
                     'completed' => 0, 'failed' => 0, 'cancelled' => 0, 'refunded' => 0, 'on_hold' => 0, 'processing' => 0
                 ],
-                'debug_error'      => 'Missing Store ID or Token',
             ];
         }
 
         $all_orders = [];
-        $debug_log = [];
 
         $ts_start = strtotime($start_date . ' 00:00:00');
         $ts_end   = strtotime($end_date . ' 23:59:59');
 
         $date_formats = [
-            ['from' => (string)$ts_start,               'to' => (string)$ts_end],
-            ['from' => (string)($ts_start * 1000),      'to' => (string)($ts_end * 1000)],
-            ['from' => $start_date . 'T00:00:00Z',     'to' => $end_date . 'T23:59:59Z'],
-            ['from' => $start_date . ' 00:00:00',      'to' => $end_date . ' 23:59:59'],
-            ['from' => $start_date,                     'to' => $end_date],
+            ['from' => (string)$ts_start,          'to' => (string)$ts_end],
+            ['from' => (string)($ts_start * 1000), 'to' => (string)($ts_end * 1000)],
+            ['from' => $start_date . 'T00:00:00Z', 'to' => $end_date . 'T23:59:59Z'],
+            ['from' => $start_date . ' 00:00:00', 'to' => $end_date . ' 23:59:59'],
+            ['from' => $start_date,                'to' => $end_date],
         ];
 
         foreach ($tokens_to_try as $token) {
@@ -415,7 +415,6 @@ class CANSOFT_Order_Info_Admin {
                 $batch_orders = [];
 
                 do {
-                    // Method 1: Query string token
                     $url = sprintf(
                         'https://app.ecwid.com/api/v3/%s/orders?token=%s&createdFrom=%s&createdTo=%s&offset=%d&limit=%d',
                         rawurlencode($store_id),
@@ -429,53 +428,18 @@ class CANSOFT_Order_Info_Admin {
                     $response = wp_remote_get($url, [
                         'timeout' => 20,
                         'headers' => [
-                            'Accept' => 'application/json',
+                            'Accept'        => 'application/json',
+                            'Authorization' => 'Bearer ' . $token,
                         ],
                     ]);
 
-                    // Method 2: If 403, try secret_token query parameter
-                    if (!is_wp_error($response) && wp_remote_retrieve_response_code($response) === 403) {
-                        $url_secret = sprintf(
-                            'https://app.ecwid.com/api/v3/%s/orders?secret_token=%s&createdFrom=%s&createdTo=%s&offset=%d&limit=%d',
-                            rawurlencode($store_id),
-                            rawurlencode($token),
-                            rawurlencode($df['from']),
-                            rawurlencode($df['to']),
-                            $offset,
-                            $limit
-                        );
-                        $response_alt = wp_remote_get($url_secret, [
-                            'timeout' => 20,
-                            'headers' => ['Accept' => 'application/json'],
-                        ]);
-                        if (!is_wp_error($response_alt) && wp_remote_retrieve_response_code($response_alt) === 200) {
-                            $response = $response_alt;
-                        }
-                    }
-
-                    if (is_wp_error($response)) {
-                        $debug_log[] = 'WP_Error: ' . $response->get_error_message();
+                    if (is_wp_error($response) || wp_remote_retrieve_response_code($response) !== 200) {
                         break;
                     }
 
-                    $code = wp_remote_retrieve_response_code($response);
                     $body = wp_remote_retrieve_body($response);
-
-                    if ($code !== 200) {
-                        $debug_log[] = "HTTP {$code}: " . substr(strip_tags($body), 0, 150);
-                        break;
-                    }
-
                     $data = json_decode($body, true);
-                    if (!is_array($data)) {
-                        $debug_log[] = 'Invalid JSON response';
-                        break;
-                    }
-
-                    $items_count = (!empty($data['items']) && is_array($data['items'])) ? count($data['items']) : 0;
-                    $debug_log[] = "Fetched {$items_count} orders";
-
-                    if ($items_count === 0) {
+                    if (!is_array($data) || empty($data['items'])) {
                         break;
                     }
 
@@ -484,27 +448,28 @@ class CANSOFT_Order_Info_Admin {
                     $total_count = isset($data['total']) ? intval($data['total']) : count($batch_orders);
 
                     $offset += count($items);
-                } while ($offset < $total_count && $items_count >= $limit);
+                } while ($offset < $total_count && count($items) >= $limit);
 
                 if (!empty($batch_orders)) {
                     $all_orders = $batch_orders;
-                    break 2; // Break both date_formats and tokens_to_try
+                    break 2;
                 }
             }
         }
 
-        // Final Fallback: Fetch recent 100 orders without createdFrom/createdTo and filter in PHP
         if (empty($all_orders)) {
             foreach ($tokens_to_try as $token) {
                 $url = sprintf(
-                    'https://app.ecwid.com/api/v3/%s/orders?token=%s&limit=100',
-                    rawurlencode($store_id),
-                    rawurlencode($token)
+                    'https://app.ecwid.com/api/v3/%s/orders?limit=100',
+                    rawurlencode($store_id)
                 );
 
                 $response = wp_remote_get($url, [
                     'timeout' => 20,
-                    'headers' => ['Accept' => 'application/json'],
+                    'headers' => [
+                        'Accept'        => 'application/json',
+                        'Authorization' => 'Bearer ' . $token,
+                    ],
                 ]);
 
                 if (!is_wp_error($response) && wp_remote_retrieve_response_code($response) === 200) {
@@ -531,7 +496,6 @@ class CANSOFT_Order_Info_Admin {
                                 $all_orders[] = $order;
                             }
                         }
-                        $debug_log[] = 'PHP filtered orders count: ' . count($all_orders) . ' out of ' . count($data['items']);
                         if (!empty($all_orders)) {
                             break;
                         }
@@ -595,7 +559,6 @@ class CANSOFT_Order_Info_Admin {
             'total_items_sold' => $total_items_sold,
             'avg_order_value'  => round($avg_order_value, 2),
             'status_counts'    => $status_counts,
-            'debug_log'        => $debug_log,
         ];
     }
 }
