@@ -25,6 +25,7 @@ class CANSOFT_Order_Info_Admin {
         add_action('admin_init', [$this, 'register_settings']);
 
         add_action('wp_ajax_cansoft_order_info_test_connection', [$this, 'ajax_test_connection']);
+        add_action('wp_ajax_cansoft_order_info_test_store', [$this, 'ajax_test_store_connection']);
 
         // REST API hooks for sales reporting
         add_action('rest_api_init', [$this, 'register_rest_routes']);
@@ -116,12 +117,94 @@ class CANSOFT_Order_Info_Admin {
                         </td>
                     </tr>
                 </table>
-                <div style="display: flex; align-items: center; gap: 15px; margin-top: 20px;">
+                <div style="display: flex; align-items: center; gap: 15px; margin-top: 20px; flex-wrap: wrap;">
                     <?php submit_button('', 'primary', 'submit', false); ?>
+                    <button type="button" id="cansoft-test-store-btn" class="button button-secondary"><?php esc_html_e('Test Store Connection', 'cansoft-order-info-send'); ?></button>
+                    <span id="cansoft-test-store-result" style="font-weight: 600;"></span>
                 </div>
             </form>
+            <script>
+            jQuery(document).ready(function($) {
+                $('#cansoft-test-store-btn').on('click', function(e) {
+                    e.preventDefault();
+                    var $btn = $(this);
+                    var $res = $('#cansoft-test-store-result');
+                    $btn.prop('disabled', true).text('Testing Store Connection...');
+                    $res.text('').css('color', '#666');
+
+                    $.post(ajaxurl, {
+                        action: 'cansoft_order_info_test_store',
+                        store_type: $('#cansoft_order_info_store_type').val(),
+                        store_id: $('#cansoft_order_info_ecwid_store_id').val(),
+                        token: $('#cansoft_order_info_ecwid_token').val(),
+                        _wpnonce: '<?php echo wp_create_nonce("cansoft_order_info_test_store_nonce"); ?>'
+                    }, function(resp) {
+                        $btn.prop('disabled', false).text('Test Store Connection');
+                        if (resp.success) {
+                            $res.text(resp.data.message).css('color', '#135e96');
+                        } else {
+                            $res.text(resp.data.message || 'Connection failed.').css('color', '#d63638');
+                        }
+                    });
+                });
+            });
+            </script>
         </div>
         <?php
+    }
+
+    public function ajax_test_store_connection() {
+        check_ajax_referer('cansoft_order_info_test_store_nonce');
+        if (!current_user_can('manage_options')) {
+            wp_send_json_error(['message' => __('Permission denied.', 'cansoft-order-info-send')]);
+        }
+
+        $store_type = isset($_POST['store_type']) ? sanitize_text_field(wp_unslash($_POST['store_type'])) : 'auto';
+        $store_id   = isset($_POST['store_id']) ? sanitize_text_field(wp_unslash($_POST['store_id'])) : '';
+        $token      = isset($_POST['token']) ? sanitize_text_field(wp_unslash($_POST['token'])) : '';
+
+        if (empty($store_id)) {
+            $store_id = get_option('cansoft_order_info_ecwid_store_id', get_option('ecwid_store_id', ''));
+        }
+        if (empty($token)) {
+            $token = get_option('cansoft_order_info_ecwid_token', get_option('ecwid_oauth_token', get_option('ecwid_api_secret_key', '')));
+        }
+
+        $is_ecwid = ($store_type === 'ecwid') || (!empty($store_id) && $store_type !== 'woocommerce');
+
+        if ($is_ecwid) {
+            if (empty($store_id) || empty($token)) {
+                wp_send_json_error(['message' => __('Ecwid Store ID or Access Token is missing.', 'cansoft-order-info-send')]);
+            }
+
+            $url = 'https://app.ecwid.com/api/v3/' . rawurlencode($store_id) . '/orders?token=' . rawurlencode($token) . '&limit=1';
+            $response = wp_remote_get($url, ['timeout' => 15, 'headers' => ['Accept' => 'application/json']]);
+
+            if (is_wp_error($response)) {
+                wp_send_json_error(['message' => __('Ecwid API Error: ', 'cansoft-order-info-send') . $response->get_error_message()]);
+            }
+
+            $code = wp_remote_retrieve_response_code($response);
+            $body = wp_remote_retrieve_body($response);
+
+            if ($code === 200) {
+                $data = json_decode($body, true);
+                $count = isset($data['total']) ? intval($data['total']) : 0;
+                wp_send_json_success(['message' => sprintf(__('Ecwid Connection Successful! Connected to Store ID %s (Total Orders: %d)', 'cansoft-order-info-send'), $store_id, $count)]);
+            }
+
+            $data = json_decode($body, true);
+            $err = isset($data['errorMessage']) ? $data['errorMessage'] : ('HTTP ' . $code);
+            wp_send_json_error(['message' => __('Ecwid API Error: ', 'cansoft-order-info-send') . $err]);
+        } else {
+            if (!class_exists('WooCommerce')) {
+                wp_send_json_error(['message' => __('WooCommerce plugin is not active on this site.', 'cansoft-order-info-send')]);
+            }
+
+            global $wpdb;
+            $count = $wpdb->get_var("SELECT COUNT(order_id) FROM {$wpdb->prefix}wc_order_stats");
+            wp_send_json_success(['message' => sprintf(__('WooCommerce Connection Successful! Total orders in database: %d', 'cansoft-order-info-send'), intval($count))]);
+        }
     }
 
     public function ajax_test_connection() {
@@ -284,12 +367,20 @@ class CANSOFT_Order_Info_Admin {
 
     protected function get_ecwid_sales_metrics_for_period($start_date, $end_date, $request_params = []) {
         $store_id = !empty($request_params['ecwid_store_id']) ? sanitize_text_field($request_params['ecwid_store_id']) : get_option('cansoft_order_info_ecwid_store_id', get_option('ecwid_store_id', ''));
-        $token    = !empty($request_params['ecwid_token']) ? sanitize_text_field($request_params['ecwid_token']) : get_option('cansoft_order_info_ecwid_token', get_option('ecwid_oauth_token', get_option('ecwid_api_secret_key', '')));
+        
+        $tokens_to_try = array_values(array_unique(array_filter([
+            !empty($request_params['ecwid_token']) ? sanitize_text_field($request_params['ecwid_token']) : '',
+            get_option('cansoft_order_info_ecwid_token', ''),
+            get_option('ecwid_oauth_token', ''),
+            get_option('ecwid_api_secret_key', ''),
+            get_option('ecwid_api_certificate', ''),
+            get_option('ecwid_public_token', ''),
+        ])));
 
-        if (empty($store_id) || empty($token)) {
+        if (empty($store_id) || empty($tokens_to_try)) {
             CANSOFT_Order_Info_Sender::log('Ecwid fetch aborted: Store ID or Token is empty', [
                 'store_id'  => $store_id,
-                'has_token' => !empty($token)
+                'has_tokens' => !empty($tokens_to_try)
             ]);
             return [
                 'total_sales'      => 0,
@@ -306,7 +397,6 @@ class CANSOFT_Order_Info_Admin {
         $all_orders = [];
         $debug_log = [];
 
-        // Try date formats in order: Unix timestamp in seconds -> ISO 8601 -> YYYY-MM-DD HH:MM:SS -> YYYY-MM-DD
         $ts_start = strtotime($start_date . ' 00:00:00');
         $ts_end   = strtotime($end_date . ' 23:59:59');
 
@@ -318,112 +408,134 @@ class CANSOFT_Order_Info_Admin {
             ['from' => $start_date,                     'to' => $end_date],
         ];
 
-        foreach ($date_formats as $df) {
-            $offset = 0;
-            $limit  = 100;
-            $batch_orders = [];
+        foreach ($tokens_to_try as $token) {
+            foreach ($date_formats as $df) {
+                $offset = 0;
+                $limit  = 100;
+                $batch_orders = [];
 
-            do {
-                $url = sprintf(
-                    'https://app.ecwid.com/api/v3/%s/orders?token=%s&createdFrom=%s&createdTo=%s&offset=%d&limit=%d',
-                    rawurlencode($store_id),
-                    rawurlencode($token),
-                    rawurlencode($df['from']),
-                    rawurlencode($df['to']),
-                    $offset,
-                    $limit
-                );
+                do {
+                    // Method 1: Query string token
+                    $url = sprintf(
+                        'https://app.ecwid.com/api/v3/%s/orders?token=%s&createdFrom=%s&createdTo=%s&offset=%d&limit=%d',
+                        rawurlencode($store_id),
+                        rawurlencode($token),
+                        rawurlencode($df['from']),
+                        rawurlencode($df['to']),
+                        $offset,
+                        $limit
+                    );
 
-                $response = wp_remote_get($url, [
-                    'timeout' => 20,
-                    'headers' => [
-                        'Accept'        => 'application/json',
-                        'Authorization' => 'Bearer ' . $token,
-                    ],
-                ]);
+                    $response = wp_remote_get($url, [
+                        'timeout' => 20,
+                        'headers' => [
+                            'Accept' => 'application/json',
+                        ],
+                    ]);
 
-                if (is_wp_error($response)) {
-                    $debug_log[] = 'WP_Error: ' . $response->get_error_message();
-                    break;
+                    // Method 2: If 403, try secret_token query parameter
+                    if (!is_wp_error($response) && wp_remote_retrieve_response_code($response) === 403) {
+                        $url_secret = sprintf(
+                            'https://app.ecwid.com/api/v3/%s/orders?secret_token=%s&createdFrom=%s&createdTo=%s&offset=%d&limit=%d',
+                            rawurlencode($store_id),
+                            rawurlencode($token),
+                            rawurlencode($df['from']),
+                            rawurlencode($df['to']),
+                            $offset,
+                            $limit
+                        );
+                        $response_alt = wp_remote_get($url_secret, [
+                            'timeout' => 20,
+                            'headers' => ['Accept' => 'application/json'],
+                        ]);
+                        if (!is_wp_error($response_alt) && wp_remote_retrieve_response_code($response_alt) === 200) {
+                            $response = $response_alt;
+                        }
+                    }
+
+                    if (is_wp_error($response)) {
+                        $debug_log[] = 'WP_Error: ' . $response->get_error_message();
+                        break;
+                    }
+
+                    $code = wp_remote_retrieve_response_code($response);
+                    $body = wp_remote_retrieve_body($response);
+
+                    if ($code !== 200) {
+                        $debug_log[] = "HTTP {$code}: " . substr(strip_tags($body), 0, 150);
+                        break;
+                    }
+
+                    $data = json_decode($body, true);
+                    if (!is_array($data)) {
+                        $debug_log[] = 'Invalid JSON response';
+                        break;
+                    }
+
+                    $items_count = (!empty($data['items']) && is_array($data['items'])) ? count($data['items']) : 0;
+                    $debug_log[] = "Fetched {$items_count} orders";
+
+                    if ($items_count === 0) {
+                        break;
+                    }
+
+                    $items = $data['items'];
+                    $batch_orders = array_merge($batch_orders, $items);
+                    $total_count = isset($data['total']) ? intval($data['total']) : count($batch_orders);
+
+                    $offset += count($items);
+                } while ($offset < $total_count && $items_count >= $limit);
+
+                if (!empty($batch_orders)) {
+                    $all_orders = $batch_orders;
+                    break 2; // Break both date_formats and tokens_to_try
                 }
-
-                $code = wp_remote_retrieve_response_code($response);
-                $body = wp_remote_retrieve_body($response);
-
-                if ($code !== 200) {
-                    $debug_log[] = "HTTP {$code}: {$body}";
-                    break;
-                }
-
-                $data = json_decode($body, true);
-                if (!is_array($data)) {
-                    $debug_log[] = 'Invalid JSON: ' . $body;
-                    break;
-                }
-
-                $items_count = (!empty($data['items']) && is_array($data['items'])) ? count($data['items']) : 0;
-                $debug_log[] = "Fetched {$items_count} orders (format {$df['from']} to {$df['to']})";
-
-                if ($items_count === 0) {
-                    break;
-                }
-
-                $items = $data['items'];
-                $batch_orders = array_merge($batch_orders, $items);
-                $total_count = isset($data['total']) ? intval($data['total']) : count($batch_orders);
-
-                $offset += count($items);
-            } while ($offset < $total_count && $items_count >= $limit);
-
-            if (!empty($batch_orders)) {
-                $all_orders = $batch_orders;
-                break;
             }
         }
 
         // Final Fallback: Fetch recent 100 orders without createdFrom/createdTo and filter in PHP
         if (empty($all_orders)) {
-            $url = sprintf(
-                'https://app.ecwid.com/api/v3/%s/orders?token=%s&limit=100',
-                rawurlencode($store_id),
-                rawurlencode($token)
-            );
+            foreach ($tokens_to_try as $token) {
+                $url = sprintf(
+                    'https://app.ecwid.com/api/v3/%s/orders?token=%s&limit=100',
+                    rawurlencode($store_id),
+                    rawurlencode($token)
+                );
 
-            $response = wp_remote_get($url, [
-                'timeout' => 20,
-                'headers' => [
-                    'Accept'        => 'application/json',
-                    'Authorization' => 'Bearer ' . $token,
-                ],
-            ]);
+                $response = wp_remote_get($url, [
+                    'timeout' => 20,
+                    'headers' => ['Accept' => 'application/json'],
+                ]);
 
-            if (!is_wp_error($response) && wp_remote_retrieve_response_code($response) === 200) {
-                $body = wp_remote_retrieve_body($response);
-                $data = json_decode($body, true);
-                if (!empty($data['items']) && is_array($data['items'])) {
-                    $start_ts = strtotime($start_date . ' 00:00:00');
-                    $end_ts   = strtotime($end_date . ' 23:59:59');
+                if (!is_wp_error($response) && wp_remote_retrieve_response_code($response) === 200) {
+                    $body = wp_remote_retrieve_body($response);
+                    $data = json_decode($body, true);
+                    if (!empty($data['items']) && is_array($data['items'])) {
+                        $start_ts = strtotime($start_date . ' 00:00:00');
+                        $end_ts   = strtotime($end_date . ' 23:59:59');
 
-                    foreach ($data['items'] as $order) {
-                        $order_time = 0;
-                        if (!empty($order['createTimestamp'])) {
-                            $order_time = floatval($order['createTimestamp']);
-                            if ($order_time > 20000000000) {
-                                $order_time = intval($order_time / 1000);
+                        foreach ($data['items'] as $order) {
+                            $order_time = 0;
+                            if (!empty($order['createTimestamp'])) {
+                                $order_time = floatval($order['createTimestamp']);
+                                if ($order_time > 20000000000) {
+                                    $order_time = intval($order_time / 1000);
+                                }
+                            } elseif (!empty($order['created'])) {
+                                $order_time = strtotime($order['created']);
+                            } elseif (!empty($order['createDate'])) {
+                                $order_time = strtotime($order['createDate']);
                             }
-                        } elseif (!empty($order['created'])) {
-                            $order_time = strtotime($order['created']);
-                        } elseif (!empty($order['createDate'])) {
-                            $order_time = strtotime($order['createDate']);
-                        }
 
-                        if ($order_time >= $start_ts && $order_time <= $end_ts) {
-                            $all_orders[] = $order;
+                            if ($order_time >= $start_ts && $order_time <= $end_ts) {
+                                $all_orders[] = $order;
+                            }
+                        }
+                        $debug_log[] = 'PHP filtered orders count: ' . count($all_orders) . ' out of ' . count($data['items']);
+                        if (!empty($all_orders)) {
+                            break;
                         }
                     }
-                    $debug_log[] = 'PHP filtered orders count: ' . count($all_orders) . ' out of ' . count($data['items']);
-                } else {
-                    $debug_log[] = 'Fallback raw body: ' . substr($body, 0, 300);
                 }
             }
         }
