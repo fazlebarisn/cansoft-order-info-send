@@ -2,7 +2,7 @@
 /**
  * Plugin Name:       Cansoft Order Info Send
  * Description:       Exposes REST API endpoints for the Cansoft Report System on the main site to fetch sales and order metrics on demand from WooCommerce or Ecwid.
- * Version:           1.0.2
+ * Version:           1.0.4
  * Author:            Fazle Bari
  * Text Domain:       cansoft-order-info-send
  * Domain Path:       /languages

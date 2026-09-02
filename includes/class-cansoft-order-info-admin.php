@@ -313,32 +313,111 @@ class CANSOFT_Order_Info_Admin {
     protected function get_woocommerce_sales_metrics_for_period($start_date, $end_date) {
         global $wpdb;
 
+        $total_orders     = 0;
+        $total_items_sold = 0;
+        $total_sales      = 0.0;
+        $net_sales        = 0.0;
+        $gross_sales      = 0.0;
+        $avg_order_value  = 0.0;
+        $got_wc_analytics = false;
+
+        // Method 1: Use WooCommerce Analytics Query class directly (exact match to WooCommerce Analytics dashboard)
+        if (class_exists('\Automattic\WooCommerce\Admin\API\Reports\Orders\Stats\Query')) {
+            try {
+                $query_args = [
+                    'after'  => $start_date . ' 00:00:00',
+                    'before' => $end_date . ' 23:59:59',
+                    'fields' => [
+                        'orders_count',
+                        'num_items_sold',
+                        'total_sales',
+                        'net_revenue',
+                        'gross_sales',
+                        'avg_order_value',
+                        'avg_items_per_order',
+                    ],
+                ];
+                $stats_query = new \Automattic\WooCommerce\Admin\API\Reports\Orders\Stats\Query($query_args);
+                $report_data = $stats_query->get_data();
+
+                if (!empty($report_data->totals)) {
+                    $totals = (object) $report_data->totals;
+                    $total_orders     = isset($totals->orders_count) ? intval($totals->orders_count) : 0;
+                    $total_items_sold = isset($totals->num_items_sold) ? intval($totals->num_items_sold) : 0;
+                    $net_sales        = isset($totals->net_revenue) ? floatval($totals->net_revenue) : 0;
+                    $gross_sales      = isset($totals->gross_sales) ? floatval($totals->gross_sales) : (isset($totals->total_sales) ? floatval($totals->total_sales) : 0);
+                    $total_sales      = isset($totals->total_sales) ? floatval($totals->total_sales) : $net_sales;
+                    $avg_order_value  = isset($totals->avg_order_value) ? floatval($totals->avg_order_value) : ($total_orders > 0 ? ($net_sales / $total_orders) : 0);
+                    $got_wc_analytics = true;
+                }
+            } catch (\Throwable $e) {
+                // Fallback to SQL query below
+            }
+        }
+
+        // Method 2: SQL query fallback if WooCommerce Analytics Query class is unavailable
+        if (!$got_wc_analytics && class_exists('WooCommerce')) {
+            $start = $start_date . ' 00:00:00';
+            $end   = $end_date . ' 23:59:59';
+
+            $excluded_statuses = get_option('woocommerce_excluded_report_order_statuses', ['pending', 'cancelled', 'failed']);
+            if (!is_array($excluded_statuses) || empty($excluded_statuses)) {
+                $excluded_statuses = ['pending', 'cancelled', 'failed'];
+            }
+            $excluded_db_statuses = [];
+            foreach ($excluded_statuses as $st) {
+                $st = trim((string) $st);
+                if ($st !== '') {
+                    $excluded_db_statuses[] = strpos($st, 'wc-') === 0 ? $st : 'wc-' . $st;
+                }
+            }
+            $excluded_db_statuses[] = 'trash';
+            $excluded_db_statuses[] = 'wc-trash';
+            $excluded_db_statuses[] = 'auto-draft';
+            $excluded_db_statuses = array_values(array_unique($excluded_db_statuses));
+            $excluded_sql = "'" . implode("','", array_map('esc_sql', $excluded_db_statuses)) . "'";
+
+            $summary = $wpdb->get_row($wpdb->prepare(
+                "SELECT 
+                    COUNT(CASE WHEN parent_id = 0 THEN 1 ELSE NULL END) as total_orders,
+                    SUM(CASE WHEN parent_id = 0 THEN num_items_sold ELSE 0 END) as total_items_sold,
+                    SUM(net_total) as net_sales,
+                    SUM(shipping_total) as shipping_total,
+                    SUM(total_sales) as total_sales
+                FROM {$wpdb->prefix}wc_order_stats
+                WHERE date_created >= %s 
+                  AND date_created <= %s
+                  AND status NOT IN ({$excluded_sql})",
+                $start,
+                $end
+            ), ARRAY_A);
+
+            if ($summary) {
+                $total_orders     = isset($summary['total_orders']) ? intval($summary['total_orders']) : 0;
+                $total_items_sold = isset($summary['total_items_sold']) ? intval($summary['total_items_sold']) : 0;
+                $net_sales        = isset($summary['net_sales']) ? floatval($summary['net_sales']) : 0;
+                $total_sales      = isset($summary['total_sales']) ? floatval($summary['total_sales']) : 0;
+                $shipping_total   = isset($summary['shipping_total']) ? floatval($summary['shipping_total']) : 0;
+                if ($total_orders > 0) {
+                    $aov_basis = ($net_sales + $shipping_total) > 0 ? ($net_sales + $shipping_total) : $net_sales;
+                    $avg_order_value = $aov_basis / $total_orders;
+                }
+            }
+        }
+
+        // Display Total Sales as Net Sales to match WooCommerce Analytics "Net sales" dashboard card
+        $display_total_sales = $net_sales > 0 ? $net_sales : $total_sales;
+
+        // Status counts for all orders in period (excluding refund sub-rows parent_id > 0)
         $start = $start_date . ' 00:00:00';
         $end   = $end_date . ' 23:59:59';
-
-        $summary = $wpdb->get_row($wpdb->prepare(
-            "SELECT 
-                SUM(total_sales) as total_sales,
-                COUNT(order_id) as total_orders,
-                SUM(num_items_sold) as total_items_sold
-            FROM {$wpdb->prefix}wc_order_stats
-            WHERE date_created >= %s 
-              AND date_created <= %s
-              AND status IN ('wc-completed', 'wc-processing', 'wc-on-hold')",
-            $start,
-            $end
-        ), ARRAY_A);
-
-        $total_sales      = isset($summary['total_sales']) ? floatval($summary['total_sales']) : 0;
-        $total_orders     = isset($summary['total_orders']) ? intval($summary['total_orders']) : 0;
-        $total_items_sold = isset($summary['total_items_sold']) ? intval($summary['total_items_sold']) : 0;
-        $avg_order_value  = $total_orders > 0 ? ($total_sales / $total_orders) : 0;
 
         $status_rows = $wpdb->get_results($wpdb->prepare(
             "SELECT status, COUNT(order_id) as count
             FROM {$wpdb->prefix}wc_order_stats
             WHERE date_created >= %s 
               AND date_created <= %s
+              AND parent_id = 0
             GROUP BY status",
             $start,
             $end
@@ -353,17 +432,21 @@ class CANSOFT_Order_Info_Admin {
             'processing' => 0,
         ];
 
-        foreach ($status_rows as $row) {
-            $raw_status = str_replace('wc-', '', $row['status']);
-            $status_key = str_replace('-', '_', $raw_status);
+        if (is_array($status_rows)) {
+            foreach ($status_rows as $row) {
+                $raw_status = str_replace('wc-', '', $row['status']);
+                $status_key = str_replace('-', '_', $raw_status);
 
-            if (array_key_exists($status_key, $status_counts)) {
-                $status_counts[$status_key] = intval($row['count']);
+                if (array_key_exists($status_key, $status_counts)) {
+                    $status_counts[$status_key] = intval($row['count']);
+                }
             }
         }
 
         return [
-            'total_sales'      => round($total_sales, 2),
+            'total_sales'      => round($display_total_sales, 2),
+            'net_sales'        => round($net_sales, 2),
+            'gross_sales'      => round($gross_sales > 0 ? $gross_sales : $total_sales, 2),
             'total_orders'     => $total_orders,
             'total_items_sold' => $total_items_sold,
             'avg_order_value'  => round($avg_order_value, 2),
@@ -384,6 +467,10 @@ class CANSOFT_Order_Info_Admin {
         ])));
 
         if (empty($store_id) || empty($tokens_to_try)) {
+            CANSOFT_Order_Info_Sender::log('Ecwid fetch aborted: Store ID or Token is empty', [
+                'store_id'  => $store_id,
+                'has_tokens' => !empty($tokens_to_try)
+            ]);
             return [
                 'total_sales'      => 0,
                 'total_orders'     => 0,
@@ -392,20 +479,22 @@ class CANSOFT_Order_Info_Admin {
                 'status_counts'    => [
                     'completed' => 0, 'failed' => 0, 'cancelled' => 0, 'refunded' => 0, 'on_hold' => 0, 'processing' => 0
                 ],
+                'debug_error'      => 'Missing Store ID or Token',
             ];
         }
 
         $all_orders = [];
+        $debug_log = [];
 
         $ts_start = strtotime($start_date . ' 00:00:00');
         $ts_end   = strtotime($end_date . ' 23:59:59');
 
         $date_formats = [
-            ['from' => (string)$ts_start,          'to' => (string)$ts_end],
-            ['from' => (string)($ts_start * 1000), 'to' => (string)($ts_end * 1000)],
-            ['from' => $start_date . 'T00:00:00Z', 'to' => $end_date . 'T23:59:59Z'],
-            ['from' => $start_date . ' 00:00:00', 'to' => $end_date . ' 23:59:59'],
-            ['from' => $start_date,                'to' => $end_date],
+            ['from' => (string)$ts_start,               'to' => (string)$ts_end],
+            ['from' => (string)($ts_start * 1000),      'to' => (string)($ts_end * 1000)],
+            ['from' => $start_date . 'T00:00:00Z',     'to' => $end_date . 'T23:59:59Z'],
+            ['from' => $start_date . ' 00:00:00',      'to' => $end_date . ' 23:59:59'],
+            ['from' => $start_date,                     'to' => $end_date],
         ];
 
         foreach ($tokens_to_try as $token) {
@@ -415,6 +504,7 @@ class CANSOFT_Order_Info_Admin {
                 $batch_orders = [];
 
                 do {
+                    // Method 1: Bearer header + token URL parameter
                     $url = sprintf(
                         'https://app.ecwid.com/api/v3/%s/orders?token=%s&createdFrom=%s&createdTo=%s&offset=%d&limit=%d',
                         rawurlencode($store_id),
@@ -433,13 +523,49 @@ class CANSOFT_Order_Info_Admin {
                         ],
                     ]);
 
-                    if (is_wp_error($response) || wp_remote_retrieve_response_code($response) !== 200) {
+                    // Method 2: If 403, try secret_token query parameter
+                    if (!is_wp_error($response) && wp_remote_retrieve_response_code($response) === 403) {
+                        $url_secret = sprintf(
+                            'https://app.ecwid.com/api/v3/%s/orders?secret_token=%s&createdFrom=%s&createdTo=%s&offset=%d&limit=%d',
+                            rawurlencode($store_id),
+                            rawurlencode($token),
+                            rawurlencode($df['from']),
+                            rawurlencode($df['to']),
+                            $offset,
+                            $limit
+                        );
+                        $response_alt = wp_remote_get($url_secret, [
+                            'timeout' => 20,
+                            'headers' => ['Accept' => 'application/json'],
+                        ]);
+                        if (!is_wp_error($response_alt) && wp_remote_retrieve_response_code($response_alt) === 200) {
+                            $response = $response_alt;
+                        }
+                    }
+
+                    if (is_wp_error($response)) {
+                        $debug_log[] = 'WP_Error: ' . $response->get_error_message();
                         break;
                     }
 
+                    $code = wp_remote_retrieve_response_code($response);
                     $body = wp_remote_retrieve_body($response);
+
+                    if ($code !== 200) {
+                        $debug_log[] = "HTTP {$code}: " . substr(strip_tags($body), 0, 150);
+                        break;
+                    }
+
                     $data = json_decode($body, true);
-                    if (!is_array($data) || empty($data['items'])) {
+                    if (!is_array($data)) {
+                        $debug_log[] = 'Invalid JSON response';
+                        break;
+                    }
+
+                    $items_count = (!empty($data['items']) && is_array($data['items'])) ? count($data['items']) : 0;
+                    $debug_log[] = "Fetched {$items_count} orders";
+
+                    if ($items_count === 0) {
                         break;
                     }
 
@@ -448,15 +574,16 @@ class CANSOFT_Order_Info_Admin {
                     $total_count = isset($data['total']) ? intval($data['total']) : count($batch_orders);
 
                     $offset += count($items);
-                } while ($offset < $total_count && count($items) >= $limit);
+                } while ($offset < $total_count && $items_count >= $limit);
 
                 if (!empty($batch_orders)) {
                     $all_orders = $batch_orders;
-                    break 2;
+                    break 2; // Break both date_formats and tokens_to_try
                 }
             }
         }
 
+        // Final Fallback: Fetch recent 100 orders without createdFrom/createdTo and filter in PHP
         if (empty($all_orders)) {
             foreach ($tokens_to_try as $token) {
                 $url = sprintf(
@@ -496,6 +623,7 @@ class CANSOFT_Order_Info_Admin {
                                 $all_orders[] = $order;
                             }
                         }
+                        $debug_log[] = 'PHP filtered orders count: ' . count($all_orders) . ' out of ' . count($data['items']);
                         if (!empty($all_orders)) {
                             break;
                         }
@@ -559,6 +687,7 @@ class CANSOFT_Order_Info_Admin {
             'total_items_sold' => $total_items_sold,
             'avg_order_value'  => round($avg_order_value, 2),
             'status_counts'    => $status_counts,
+            'debug_log'        => $debug_log,
         ];
     }
 }

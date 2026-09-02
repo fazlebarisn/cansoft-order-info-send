@@ -8,7 +8,7 @@
 defined('ABSPATH') || exit;
 
 if (!defined('CANSOFT_ORDER_INFO_DEBUG')) {
-    define('CANSOFT_ORDER_INFO_DEBUG', false);
+    define('CANSOFT_ORDER_INFO_DEBUG', true);
 }
 
 class CANSOFT_Order_Info_Sender {
